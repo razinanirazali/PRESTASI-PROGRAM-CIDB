@@ -5,6 +5,16 @@ import plotly.express as px
 from pathlib import Path
 import re
 import hmac
+from io import BytesIO
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
 
 # =====================================================
 # PAGE SETUP
@@ -170,7 +180,7 @@ QUARTER_CONFIG = {
     },
     "Suku Kedua": {
         "code": "Q2",
-        "title": "PENCAPAIAN PRESTASI FIZIKAL PROGRAM CIDB SUKU KEDUA 2026",
+        "title": "LAPORAN PRESTASI PROGRAM SEHINGGA SUKU KEDUA 2026",
         "sheet_options": [
             "DATA DASHBOARD Q2 CLEAN",
             " DATA DASHBOARD Q2 CLEAN"
@@ -205,10 +215,12 @@ PENCAPAIAN_FIZIKAL_COL_INDEX = 8
 # Column K = STATUS KHAS / MAKLUMAT BERMULA Q2, Q3, Q4
 STATUS_TEXT_COL_INDEX = 10
 
-# Column AD / kolum CATATAN (JUSTIFIKASI) Q2 digunakan untuk mengesan
-# status khas BERMULA Q3 dan BERMULA Q4.
+# Kolum CATATAN (JUSTIFIKASI) mengikut suku tahun.
+# Q2 juga digunakan untuk mengesan status khas BERMULA Q3 dan BERMULA Q4.
 Q2_JUSTIFIKASI_COL_INDEX = 30
+Q1_JUSTIFIKASI_COL = None
 Q2_JUSTIFIKASI_COL = None
+JUSTIFIKASI_COL = None
 
 
 # =====================================================
@@ -2208,8 +2220,8 @@ def render_selected_list(df_list, sektor_col, bahagian_col, program_col, pencapa
         st.warning("Tiada rekod untuk kategori ini.")
         return
 
-    # Papar kolum utama sahaja sehingga TRAFFIC_LIGHT.
-    # Kolum tambahan selepas TRAFFIC_LIGHT tidak akan dipaparkan.
+    # Papar kolum utama termasuk CATATAN (JUSTIFIKASI).
+    # Teks catatan dipaparkan dengan wrap dan tinggi maksimum kira-kira 4 baris.
     display_cols = [
         sektor_col,
         bahagian_col,
@@ -2218,7 +2230,8 @@ def render_selected_list(df_list, sektor_col, bahagian_col, program_col, pencapa
         weightage_col,
         pencapaian_col,
         "KPI_PENCAPAIAN_NUM",
-        "TRAFFIC_LIGHT"
+        "TRAFFIC_LIGHT",
+        JUSTIFIKASI_COL
     ]
 
     display_cols = [
@@ -2228,15 +2241,35 @@ def render_selected_list(df_list, sektor_col, bahagian_col, program_col, pencapa
 
     display_df = df_list[display_cols].copy()
 
-    if "KPI_PENCAPAIAN_NUM" in display_df.columns:
-        display_df = display_df.rename(
-            columns={"KPI_PENCAPAIAN_NUM": "PENCAPAIAN KPI (%)"}
+    rename_map = {"KPI_PENCAPAIAN_NUM": "PENCAPAIAN KPI (%)"}
+    if JUSTIFIKASI_COL is not None and JUSTIFIKASI_COL in display_df.columns:
+        rename_map[JUSTIFIKASI_COL] = "CATATAN (JUSTIFIKASI)"
+
+    display_df = display_df.rename(columns=rename_map)
+
+    # Bersihkan nilai kosong supaya tidak memaparkan teks <NA> / nan.
+    if "CATATAN (JUSTIFIKASI)" in display_df.columns:
+        display_df["CATATAN (JUSTIFIKASI)"] = (
+            display_df["CATATAN (JUSTIFIKASI)"]
+            .fillna("")
+            .astype(str)
+            .replace({"nan": "", "<NA>": "", "None": ""})
+        )
+
+    column_config = {}
+    if "CATATAN (JUSTIFIKASI)" in display_df.columns:
+        column_config["CATATAN (JUSTIFIKASI)"] = st.column_config.TextColumn(
+            "CATATAN (JUSTIFIKASI)",
+            width="large",
+            help="Catatan akan dibalut (wrap) sehingga kira-kira 4 baris. Teks penuh boleh dilihat dengan klik pada sel."
         )
 
     st.dataframe(
         display_df.style.apply(highlight_traffic_light, axis=1),
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        column_config=column_config,
+        row_height=86
     )
 
     csv = display_df.to_csv(index=False).encode("utf-8-sig")
@@ -2493,6 +2526,190 @@ def get_chart_source_df(filtered_df):
     return filtered_df.copy()
 
 
+def build_main_dashboard_pdf(
+    source_df,
+    bahagian_col,
+    hijau,
+    kuning,
+    merah,
+    bermula_q2,
+    bermula_q3,
+    bermula_q4,
+    tidak_dilaksanakan,
+    jumlah_program_panel,
+    sasaran_panel,
+    prestasi_panel,
+    pencapaian_panel,
+    active_quarter,
+):
+    """Jana PDF dua muka surat: Traffic Light dan graf bahagian sahaja."""
+    if not REPORTLAB_AVAILABLE:
+        return None
+
+    buffer = BytesIO()
+    page_w, page_h = landscape(A4)
+    pdf = canvas.Canvas(buffer, pagesize=(page_w, page_h))
+
+    def header(title, subtitle=None):
+        pdf.setFillColor(colors.HexColor("#16324F"))
+        pdf.rect(0, page_h - 24 * mm, page_w, 24 * mm, fill=1, stroke=0)
+        pdf.setFillColor(colors.white)
+        pdf.setFont("Helvetica-Bold", 17)
+        pdf.drawString(16 * mm, page_h - 14 * mm, title)
+        if subtitle:
+            pdf.setFont("Helvetica", 8.5)
+            pdf.drawRightString(page_w - 16 * mm, page_h - 14 * mm, subtitle)
+
+    # Muka surat 1 - Traffic Light
+    header("DASHBOARD STATUS PRESTASI FIZIKAL PROGRAM CIDB 2026", f"Suku Aktif: {active_quarter}")
+    pdf.setFillColor(colors.HexColor("#243B53"))
+    pdf.setFont("Helvetica-Bold", 15)
+    pdf.drawString(16 * mm, page_h - 37 * mm, "RINGKASAN TRAFFIC LIGHT")
+
+    cards = [
+        ("HIJAU", ">= 85%", hijau, "#2FB463"),
+        ("KUNING", "60% - 84.99%", kuning, "#F6C90E"),
+        ("MERAH", "< 60%", merah, "#EF463B"),
+    ]
+    card_y = page_h - 90 * mm
+    card_w = 72 * mm
+    card_h = 39 * mm
+    gap = 10 * mm
+    start_x = 16 * mm
+    for i, (label, range_text, value, colour) in enumerate(cards):
+        x = start_x + i * (card_w + gap)
+        pdf.setFillColor(colors.HexColor(colour))
+        pdf.roundRect(x, card_y, card_w, card_h, 6 * mm, fill=1, stroke=0)
+        pdf.setFillColor(colors.white if label != "KUNING" else colors.HexColor("#3D3D3D"))
+        pdf.setFont("Helvetica-Bold", 12)
+        pdf.drawCentredString(x + card_w / 2, card_y + card_h - 11 * mm, label)
+        pdf.setFont("Helvetica-Bold", 25)
+        pdf.drawCentredString(x + card_w / 2, card_y + 14 * mm, str(int(value)))
+        pdf.setFont("Helvetica", 9)
+        pdf.drawCentredString(x + card_w / 2, card_y + 6 * mm, range_text)
+
+    # Status suku / gugur
+    status_y = card_y - 18 * mm
+    status_items = []
+    if active_quarter == "Q1":
+        status_items.append(("Q2", bermula_q2))
+    status_items.extend([("Q3", bermula_q3), ("Q4", bermula_q4), ("GUGUR", tidak_dilaksanakan)])
+    status_text = "   |   ".join(f"{label}-{int(value)}" for label, value in status_items)
+    pdf.setFillColor(colors.HexColor("#4A5568"))
+    pdf.setFont("Helvetica-Bold", 12)
+    pdf.drawString(16 * mm, status_y, status_text)
+
+    # Panel ringkasan
+    panel_x = 16 * mm
+    panel_y = 20 * mm
+    panel_w = page_w - 32 * mm
+    panel_h = 42 * mm
+    pdf.setFillColor(colors.HexColor("#F3F6FA"))
+    pdf.setStrokeColor(colors.HexColor("#CBD5E0"))
+    pdf.roundRect(panel_x, panel_y, panel_w, panel_h, 4 * mm, fill=1, stroke=1)
+    metrics = [
+        ("JUMLAH PROGRAM AKTIF", f"{jumlah_program_panel:,.0f}"),
+        ("SASARAN", f"{sasaran_panel:.2f}%"),
+        ("PRESTASI", f"{prestasi_panel:.2f}%"),
+        ("PENCAPAIAN", f"{pencapaian_panel:.2f}%"),
+    ]
+    col_w = panel_w / len(metrics)
+    for i, (label, value) in enumerate(metrics):
+        cx = panel_x + i * col_w + col_w / 2
+        pdf.setFillColor(colors.HexColor("#52606D"))
+        pdf.setFont("Helvetica-Bold", 8.5)
+        pdf.drawCentredString(cx, panel_y + 27 * mm, label)
+        pdf.setFillColor(colors.HexColor("#16324F"))
+        pdf.setFont("Helvetica-Bold", 19)
+        pdf.drawCentredString(cx, panel_y + 13 * mm, value)
+        if i < len(metrics) - 1:
+            pdf.setStrokeColor(colors.HexColor("#D9E2EC"))
+            pdf.line(panel_x + (i + 1) * col_w, panel_y + 7 * mm, panel_x + (i + 1) * col_w, panel_y + panel_h - 7 * mm)
+
+    pdf.showPage()
+
+    # Muka surat 2 - Graf stacked bar mengikut bahagian
+    header("PENCAPAIAN MENGIKUT BAHAGIAN", "Berdasarkan filter semasa dashboard")
+    if source_df.empty or bahagian_col not in source_df.columns:
+        pdf.setFillColor(colors.HexColor("#52606D"))
+        pdf.setFont("Helvetica", 12)
+        pdf.drawCentredString(page_w / 2, page_h / 2, "Tiada data graf untuk filter yang dipilih.")
+    else:
+        chart_df = (
+            source_df.groupby([bahagian_col, "KATEGORI_TRAFFIC"], as_index=False)
+            .size().rename(columns={"size": "JUMLAH"})
+        )
+        pivot = chart_df.pivot_table(
+            index=bahagian_col, columns="KATEGORI_TRAFFIC", values="JUMLAH",
+            aggfunc="sum", fill_value=0
+        )
+        status_order = ["Hijau", "Kuning", "Merah"]
+        if active_quarter == "Q1":
+            status_order.append("Q2")
+        status_order.extend(["Q3", "Q4", "Gugur"])
+        for status in status_order:
+            if status not in pivot.columns:
+                pivot[status] = 0
+        pivot["TOTAL"] = pivot[status_order].sum(axis=1)
+        pivot = pivot.sort_values(["TOTAL"], ascending=True)
+
+        colour_map = {
+            "Hijau": "#2FB463", "Kuning": "#F6C90E", "Merah": "#EF463B",
+            "Q2": "#8E7CC3", "Q3": "#674EA7", "Q4": "#351C75", "Gugur": "#7A7788"
+        }
+        left = 74 * mm
+        right = 18 * mm
+        top = page_h - 39 * mm
+        bottom = 25 * mm
+        chart_w = page_w - left - right
+        chart_h = top - bottom
+        n = max(len(pivot), 1)
+        row_h = chart_h / n
+        bar_h = min(8 * mm, row_h * 0.62)
+        max_total = max(float(pivot["TOTAL"].max()), 1.0)
+
+        pdf.setFont("Helvetica", 7.2 if n > 18 else 8.2)
+        for idx, (bahagian, row) in enumerate(pivot.iterrows()):
+            y = bottom + idx * row_h + (row_h - bar_h) / 2
+            label = str(bahagian)
+            max_chars = 34
+            if len(label) > max_chars:
+                label = label[:max_chars - 1] + "..."
+            pdf.setFillColor(colors.HexColor("#334E68"))
+            pdf.drawRightString(left - 4 * mm, y + bar_h * 0.34, label)
+            current_x = left
+            for status in status_order:
+                value = float(row.get(status, 0))
+                if value <= 0:
+                    continue
+                width = chart_w * value / max_total
+                pdf.setFillColor(colors.HexColor(colour_map[status]))
+                pdf.rect(current_x, y, width, bar_h, fill=1, stroke=0)
+                if width >= 7 * mm:
+                    pdf.setFillColor(colors.white if status != "Kuning" else colors.HexColor("#3D3D3D"))
+                    pdf.setFont("Helvetica-Bold", 7)
+                    pdf.drawCentredString(current_x + width / 2, y + bar_h * 0.33, str(int(value)))
+                current_x += width
+            pdf.setFillColor(colors.HexColor("#334E68"))
+            pdf.setFont("Helvetica-Bold", 7.5)
+            pdf.drawString(left + chart_w + 2 * mm, y + bar_h * 0.34, str(int(row["TOTAL"])))
+
+        # Legend
+        legend_x = left
+        legend_y = 12 * mm
+        for status in status_order:
+            pdf.setFillColor(colors.HexColor(colour_map[status]))
+            pdf.rect(legend_x, legend_y, 4 * mm, 4 * mm, fill=1, stroke=0)
+            pdf.setFillColor(colors.HexColor("#334E68"))
+            pdf.setFont("Helvetica", 7.5)
+            pdf.drawString(legend_x + 5 * mm, legend_y + 0.6 * mm, status)
+            legend_x += 24 * mm
+
+    pdf.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # =====================================================
 # SIDEBAR FILTER ONLY
 # =====================================================
@@ -2587,6 +2804,12 @@ if ACTIVE_QUARTER == "Q1":
     ])
     pencapaian_col = find_col_exact(df, ["PERATUS PENCAPAIAN Q1"])
     pencapaian_fizikal_col = find_col_exact(df, ["DATA DARI BAHAGIAN"])
+    Q1_JUSTIFIKASI_COL = find_col_exact(df, [
+        "CATATAN (JUSTIFIKASI)",
+        "CATATAN JUSTIFIKASI",
+        "JUSTIFIKASI"
+    ])
+    JUSTIFIKASI_COL = Q1_JUSTIFIKASI_COL
 
     # Fallback kepada kedudukan asal Q1 jika nama kolum berubah sedikit.
     if weightage_col is None and len(df.columns) > WEIGHTAGE_COL_INDEX:
@@ -2620,6 +2843,18 @@ else:
         "CATATAN (JUSTIFIKASI) Q2",
         "JUSTIFIKASI Q2"
     ])
+
+    # Jika pandas menamakan kolum berulang sebagai .1, pilihan ini memastikan
+    # CATATAN Q2 (kolum kedua) digunakan dalam laporan Suku Kedua.
+    if Q2_JUSTIFIKASI_COL is None:
+        catatan_candidates = [
+            col for col in df.columns
+            if "CATATAN" in clean_upper(col) and "JUSTIFIKASI" in clean_upper(col)
+        ]
+        if catatan_candidates:
+            Q2_JUSTIFIKASI_COL = catatan_candidates[-1]
+
+    JUSTIFIKASI_COL = Q2_JUSTIFIKASI_COL
 
 if weightage_col is None or pencapaian_col is None:
     st.error(
@@ -3276,6 +3511,37 @@ if st.session_state.focus_page in FOCUS_PAGES:
                 )
 
     st.stop()
+
+pdf_main_page = build_main_dashboard_pdf(
+    filtered_df,
+    bahagian_col,
+    hijau,
+    kuning,
+    merah,
+    bermula_q2,
+    bermula_q3,
+    bermula_q4,
+    tidak_dilaksanakan,
+    jumlah_program_panel,
+    sasaran_panel,
+    prestasi_panel,
+    pencapaian_panel,
+    ACTIVE_QUARTER,
+)
+
+pdf_col, pdf_note_col = st.columns([1.35, 8.65])
+with pdf_col:
+    if pdf_main_page is not None:
+        st.download_button(
+            "📄 Muat Turun PDF",
+            data=pdf_main_page,
+            file_name=f"Dashboard_Traffic_dan_Graf_{ACTIVE_QUARTER}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="download_main_dashboard_pdf",
+        )
+    else:
+        st.warning("PDF memerlukan library reportlab.")
 
 traffic_focus_spacer, traffic_focus_btn = st.columns([18, 1])
 with traffic_focus_btn:
